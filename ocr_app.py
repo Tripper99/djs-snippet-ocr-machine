@@ -6,7 +6,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from docling.datamodel.base_models import ConversionStatus, InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractOcrOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 APP_TITLE = "DJ:s PDF till Markdown app"
@@ -16,7 +16,7 @@ VERSION = "0.2.0"
 def _build_converter() -> DocumentConverter:
     opts = PdfPipelineOptions()
     opts.do_ocr = True
-    opts.ocr_options = TesseractOcrOptions(lang=["swe"])
+    opts.ocr_options = TesseractCliOcrOptions(lang=["swe"])
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
