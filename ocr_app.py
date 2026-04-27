@@ -10,13 +10,13 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliO
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 APP_TITLE = "DJ:s PDF till Markdown app"
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 
 
 def _build_converter() -> DocumentConverter:
     opts = PdfPipelineOptions()
     opts.do_ocr = True
-    opts.ocr_options = TesseractCliOcrOptions(lang=["swe"])
+    opts.ocr_options = TesseractCliOcrOptions(lang=["swe"], force_full_page_ocr=True)
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
@@ -100,6 +100,7 @@ class WorkerThread(threading.Thread):
                     output_path.write_text(
                         result.document.export_to_markdown(), encoding="utf-8"
                     )
+                    del result
                     self.w2g.put(("log", f"✓ {pdf_path.name}"))
                     ok_count += 1
                 else:
@@ -171,10 +172,16 @@ class App(tk.Tk):
         # ── Förlopp ───────────────────────────────────────────────────
         prog_frame = ttk.LabelFrame(self, text="Förlopp")
         prog_frame.pack(fill=tk.X, **pad)
+
+        ttk.Label(prog_frame, text="Totalt:").pack(anchor=tk.W, padx=4, pady=(4, 0))
         self._progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode="determinate")
-        self._progress.pack(fill=tk.X, padx=4, pady=(4, 2))
+        self._progress.pack(fill=tk.X, padx=4, pady=(2, 0))
         self._progress_label = ttk.Label(prog_frame, text="")
-        self._progress_label.pack(anchor=tk.W, padx=4)
+        self._progress_label.pack(anchor=tk.W, padx=4, pady=(0, 4))
+
+        ttk.Label(prog_frame, text="Aktuell fil:").pack(anchor=tk.W, padx=4)
+        self._file_progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode="indeterminate")
+        self._file_progress.pack(fill=tk.X, padx=4, pady=(2, 0))
         self._file_label = ttk.Label(prog_frame, text="", foreground="gray")
         self._file_label.pack(anchor=tk.W, padx=4, pady=(0, 4))
 
@@ -260,6 +267,8 @@ class App(tk.Tk):
         self._cancel_btn.configure(state=tk.NORMAL)
         self._progress.configure(maximum=len(self._pdf_paths), value=0)
         self._progress_label.configure(text=f"0 av {len(self._pdf_paths)} filer")
+        self._file_progress.stop()
+        self._file_progress["value"] = 0
         self._file_label.configure(text="")
         self._log_clear()
 
@@ -294,9 +303,12 @@ class App(tk.Tk):
 
                 if kind == "progress":
                     _, idx, total, filename = msg
-                    self._progress.configure(value=idx)
-                    self._progress_label.configure(text=f"{idx} av {total} filer")
+                    self._progress.configure(value=idx - 1)
+                    self._progress_label.configure(text=f"{idx - 1} av {total} filer klara")
                     self._file_label.configure(text=f"Bearbetar: {filename}")
+                    self._file_progress.stop()
+                    self._file_progress["value"] = 0
+                    self._file_progress.start(12)
 
                 elif kind == "conflict":
                     # Hand off to _handle_conflict; stop polling until resolved
@@ -339,12 +351,15 @@ class App(tk.Tk):
         self._running = False
         self._start_btn.configure(state=tk.NORMAL)
         self._cancel_btn.configure(state=tk.DISABLED)
+        self._file_progress.stop()
+        self._file_progress["value"] = 0
         self._file_label.configure(text="")
 
+        total = int(self._progress["maximum"])
         if self._cancel_event.is_set():
             summary = f"Avbrutet — {ok} konverterade, {skip} hoppade över, {err} fel."
         else:
-            self._progress.configure(value=self._progress["maximum"])
+            self._progress.configure(value=total)
             summary = f"Klart! {ok} konverterade, {skip} hoppade över, {err} fel."
 
         self._progress_label.configure(text=summary)
