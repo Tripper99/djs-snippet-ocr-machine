@@ -1,4 +1,4 @@
-"""DJs Docling Snippet OCR Machine — clipboard image OCR tool."""
+"""DJs Snippet OCR Machine — clipboard image OCR tool."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ try:
 except ImportError:
     MacOCR = None  # type: ignore[assignment]
 
-APP_TITLE = "DJs Docling Snippet OCR Machine"
+APP_TITLE = "DJs Snippet OCR Machine"
 VERSION = "0.5.0"
 
 LANGUAGES: dict[str, str] = {
