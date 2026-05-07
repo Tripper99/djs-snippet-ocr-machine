@@ -1,1 +1,3 @@
 docling
+ocrmac
+pillow

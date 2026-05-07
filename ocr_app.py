@@ -1,439 +1,421 @@
+"""DJs Docling Snippet OCR Machine — clipboard image OCR tool."""
+
+from __future__ import annotations
+
+import hashlib
 import queue
-import shutil
+import sys
 import threading
 import tkinter as tk
-from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from datetime import datetime
+from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
 
-from docling.datamodel.base_models import ConversionStatus, InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
+try:
+    from PIL import Image, ImageGrab
+except ImportError:
+    Image = None  # type: ignore[assignment]
+    ImageGrab = None  # type: ignore[assignment]
 
-APP_TITLE = "DJ:s PDF till Markdown app"
-VERSION = "0.4.0"
+try:
+    from ocrmac.ocrmac import OCR as MacOCR
+except ImportError:
+    MacOCR = None  # type: ignore[assignment]
+
+APP_TITLE = "DJs Docling Snippet OCR Machine"
+VERSION = "0.5.0"
+
+LANGUAGES: dict[str, str] = {
+    "Svenska": "sv-SE",
+    "Engelska": "en-US",
+    "Tyska": "de-DE",
+    "Danska": "da-DK",
+    "Norska": "no-NO",
+    "Franska": "fr-FR",
+}
+
+SEPARATOR = "\n\n---\n\n"
 
 
-def _build_converter() -> DocumentConverter:
-    opts = PdfPipelineOptions()
-    opts.do_ocr = True
-    opts.ocr_options = TesseractCliOcrOptions(lang=["swe"], force_full_page_ocr=True)
-    return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# Background threads
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-class WorkerThread(threading.Thread):
+class ClipboardMonitor(threading.Thread):
+    """Polls the clipboard every 500 ms and sends new images to ocr_queue."""
+
+    def __init__(self, ocr_queue: queue.Queue, stop_event: threading.Event) -> None:
+        super().__init__(daemon=True)
+        self._queue = ocr_queue
+        self._stop = stop_event
+        self._last_hash: str | None = None
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                img = ImageGrab.grabclipboard()
+                if isinstance(img, Image.Image):
+                    h = hashlib.md5(img.tobytes()).hexdigest()
+                    if h != self._last_hash:
+                        self._last_hash = h
+                        self._queue.put(img.copy())
+            except Exception:
+                pass
+            self._stop.wait(0.5)
+
+
+class OcrWorker(threading.Thread):
+    """Reads images from ocr_queue, runs OCR, posts results to result_queue."""
+
     def __init__(
         self,
-        pdf_paths: list,
-        output_dir: Path,
-        w2g: queue.Queue,
-        g2w: queue.Queue,
-        cancel_event: threading.Event,
-        conflict_event: threading.Event,
-    ):
+        ocr_queue: queue.Queue,
+        result_queue: queue.Queue,
+        stop_event: threading.Event,
+        lang_getter,
+    ) -> None:
         super().__init__(daemon=True)
-        self.pdf_paths = pdf_paths
-        self.output_dir = output_dir
-        self.w2g = w2g
-        self.g2w = g2w
-        self.cancel_event = cancel_event
-        self.conflict_event = conflict_event
+        self._ocr_q = ocr_queue
+        self._result_q = result_queue
+        self._stop = stop_event
+        self._get_lang = lang_getter
+        self._counter = 0
 
-    def run(self):
-        ok_count = 0
-        skip_count = 0
-        err_count = 0
-        skip_all = False
-        overwrite_all = False
-        total = len(self.pdf_paths)
-
-        try:
-            converter = _build_converter()
-        except Exception as exc:
-            self.w2g.put(("log", f"Fel vid initiering: {exc}"))
-            self.w2g.put(("done", 0, 0, total))
-            return
-
-        for idx, pdf_path in enumerate(self.pdf_paths):
-            if self.cancel_event.is_set():
-                break
-
-            self.w2g.put(("progress", idx + 1, total, pdf_path.name))
-            output_path = self.output_dir / (pdf_path.stem + ".md")
-
-            # ── Conflict check ───────────────────────────────
-            if output_path.exists() and not overwrite_all:
-                if skip_all:
-                    self.w2g.put(("log", f"Hoppar över: {pdf_path.name}"))
-                    skip_count += 1
-                    continue
-
-                self.w2g.put(("conflict", str(output_path)))
-                self.conflict_event.wait()
-                self.conflict_event.clear()
-
-                action = self.g2w.get()[1]
-
-                if action == "cancel":
-                    self.cancel_event.set()
-                    break
-                elif action == "skip":
-                    self.w2g.put(("log", f"Hoppar över: {pdf_path.name}"))
-                    skip_count += 1
-                    continue
-                elif action == "skip_all":
-                    skip_all = True
-                    self.w2g.put(("log", f"Hoppar över: {pdf_path.name}"))
-                    skip_count += 1
-                    continue
-                elif action == "overwrite_all":
-                    overwrite_all = True
-                # "overwrite" and "overwrite_all" fall through to conversion
-
-            # ── Convert ──────────────────────────────────────
+    def run(self) -> None:
+        while not self._stop.is_set():
             try:
-                result = next(
-                    converter.convert_all([pdf_path], raises_on_error=False)
-                )
-                if result.status == ConversionStatus.SUCCESS:
-                    output_path.write_text(
-                        result.document.export_to_markdown(), encoding="utf-8"
-                    )
-                    del result
-                    self.w2g.put(("log", f"✓ {pdf_path.name}"))
-                    ok_count += 1
-                else:
-                    msgs = "; ".join(e.error_message for e in result.errors)
-                    self.w2g.put(("error", pdf_path.name, msgs))
-                    err_count += 1
-            except Exception as exc:
-                self.w2g.put(("error", pdf_path.name, str(exc)))
-                err_count += 1
+                img = self._ocr_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        self.w2g.put(("done", ok_count, skip_count, err_count))
+            self._counter += 1
+            snippet_id = self._counter
+            lang = self._get_lang()
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+            self._result_q.put(("pending", snippet_id, timestamp))
+
+            try:
+                annotations = MacOCR(img, language_preference=[lang]).recognize()
+                text = _annotations_to_text(annotations)
+            except Exception as exc:
+                text = f"(OCR-fel: {exc})"
+
+            self._result_q.put(("result", snippet_id, text))
+
+
+def _annotations_to_text(annotations: list) -> str:
+    """Convert Vision OCR annotations to plain text, preserving line order."""
+    if not annotations:
+        return "(ingen text hittad)"
+    # Vision coordinates: y increases upward, so high y = near top of image.
+    # Sort descending by bbox y to get top-to-bottom reading order.
+    sorted_ann = sorted(annotations, key=lambda a: -a[2][1])
+    return "\n".join(a[0] for a in sorted_ann)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Snippet card widget
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SnippetCard(ttk.Frame):
+    """A collapsible card showing one OCR result."""
+
+    def __init__(
+        self,
+        parent,
+        snippet_id: int,
+        timestamp: str,
+        copy_callback,
+    ) -> None:
+        super().__init__(parent, relief="groove", borderwidth=1)
+        self._snippet_id = snippet_id
+        self._timestamp = timestamp
+        self._copy_cb = copy_callback
+        self._text = ""
+        self._expanded = True
+        self._selected = tk.BooleanVar(value=False)
+        self._build()
+
+    def _build(self) -> None:
+        # ── Header row ────────────────────────────────────────────────
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+
+        ttk.Checkbutton(header, variable=self._selected).pack(side="left", padx=(4, 0))
+
+        self._arrow = ttk.Label(header, text="▼", cursor="hand2", width=2)
+        self._arrow.pack(side="left")
+        self._arrow.bind("<Button-1>", self._toggle)
+
+        self._title_lbl = ttk.Label(
+            header,
+            text=f"Avsnitt {self._snippet_id} — {self._timestamp}   ⏳",
+            cursor="hand2",
+            font=("Helvetica", 11, "bold"),
+        )
+        self._title_lbl.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        self._title_lbl.bind("<Button-1>", self._toggle)
+
+        self._copy_btn = ttk.Button(
+            header, text="Kopiera", width=8, command=self._copy, state="disabled"
+        )
+        self._copy_btn.pack(side="right", padx=4, pady=3)
+
+        # ── Body ──────────────────────────────────────────────────────
+        self._body = ttk.Frame(self)
+        self._body.pack(fill="x")
+
+        self._text_widget = ScrolledText(
+            self._body,
+            wrap="word",
+            height=3,
+            state="disabled",
+            font=("Helvetica", 11),
+            relief="flat",
+            borderwidth=0,
+            background="#f8f8f8",
+        )
+        self._text_widget.pack(fill="x", padx=8, pady=(0, 6))
+
+    def _toggle(self, _event=None) -> None:
+        if self._expanded:
+            self._body.pack_forget()
+            self._arrow.configure(text="►")
+        else:
+            self._body.pack(fill="x")
+            self._arrow.configure(text="▼")
+        self._expanded = not self._expanded
+        # Trigger the canvas to recalculate scroll region
+        self.event_generate("<<Resized>>", propagate=True)
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self._text_widget.configure(state="normal")
+        self._text_widget.delete("1.0", "end")
+        self._text_widget.insert("1.0", text)
+        self._text_widget.configure(state="disabled")
+        # Fit height to content (2–12 lines)
+        line_count = text.count("\n") + 1
+        self._text_widget.configure(height=min(max(line_count, 2), 12))
+        self._title_lbl.configure(
+            text=f"Avsnitt {self._snippet_id} — {self._timestamp}"
+        )
+        self._copy_btn.configure(state="normal")
+
+    def get_text(self) -> str:
+        return self._text
+
+    def is_selected(self) -> bool:
+        return self._selected.get()
+
+    def _copy(self) -> None:
+        self._copy_cb(self._text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main application
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(f"{APP_TITLE}  v{VERSION}")
+        self.minsize(560, 560)
         self.resizable(True, True)
-        self.minsize(720, 580)
 
-        self._pdf_paths: list = []
-        self._output_dir = tk.StringVar()
-        self._running = False
-        self._worker = None
-        self._w2g: queue.Queue = queue.Queue()
-        self._g2w: queue.Queue = queue.Queue()
-        self._cancel_event = threading.Event()
-        self._conflict_event = threading.Event()
+        self._ocr_queue: queue.Queue = queue.Queue()
+        self._result_queue: queue.Queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._lang_var = tk.StringVar(value="Svenska")
+        self._cards: list[SnippetCard] = []
+        self._pending: dict[int, SnippetCard] = {}
 
         self._build_ui()
-        self.after(200, self._check_tesseract)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._check_deps)
 
     # ─────────────────────────────────────────────────────────────────
-    # UI
+    # UI construction
     # ─────────────────────────────────────────────────────────────────
 
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 5}
+    def _build_ui(self) -> None:
+        # ── Control bar ───────────────────────────────────────────────
+        ctrl = ttk.Frame(self, padding=(8, 6))
+        ctrl.pack(fill="x")
 
-        # ── PDF-filer ─────────────────────────────────────────────────
-        pdf_frame = ttk.LabelFrame(self, text="PDF-filer")
-        pdf_frame.pack(fill=tk.BOTH, expand=True, **pad)
-
-        btn_row = ttk.Frame(pdf_frame)
-        btn_row.pack(fill=tk.X, padx=4, pady=(4, 2))
-        ttk.Button(btn_row, text="Lägg till filer…",  command=self._add_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Lägg till mapp…",   command=self._add_folder).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Ta bort markerade", command=self._remove_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Rensa lista",        command=self._clear_list).pack(side=tk.LEFT, padx=2)
-
-        list_frame = ttk.Frame(pdf_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
-        self._listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=8)
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=sb.set)
-        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # ── Utdatamapp ────────────────────────────────────────────────
-        out_frame = ttk.LabelFrame(self, text="Utdatamapp")
-        out_frame.pack(fill=tk.X, **pad)
-        ttk.Entry(out_frame, textvariable=self._output_dir, state="readonly").pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 2), pady=4
+        self._status_lbl = ttk.Label(
+            ctrl, text="● Övervakar urklipp...", foreground="#2a7a2a"
         )
-        ttk.Button(out_frame, text="Bläddra…", command=self._browse_output).pack(
-            side=tk.RIGHT, padx=(0, 4), pady=4
+        self._status_lbl.pack(side="left")
+
+        ttk.Button(ctrl, text="Rensa alla", command=self._clear_all).pack(
+            side="right"
         )
 
-        # ── Förlopp ───────────────────────────────────────────────────
-        prog_frame = ttk.LabelFrame(self, text="Förlopp")
-        prog_frame.pack(fill=tk.X, **pad)
+        lang_row = ttk.Frame(ctrl)
+        lang_row.pack(side="right", padx=(0, 10))
+        ttk.Label(lang_row, text="Språk:").pack(side="left")
+        ttk.Combobox(
+            lang_row,
+            textvariable=self._lang_var,
+            values=list(LANGUAGES.keys()),
+            width=10,
+            state="readonly",
+        ).pack(side="left", padx=(4, 0))
 
-        ttk.Label(prog_frame, text="Totalt:").pack(anchor=tk.W, padx=4, pady=(4, 0))
-        self._progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode="determinate")
-        self._progress.pack(fill=tk.X, padx=4, pady=(2, 0))
-        self._progress_label = ttk.Label(prog_frame, text="")
-        self._progress_label.pack(anchor=tk.W, padx=4, pady=(0, 4))
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
 
-        ttk.Label(prog_frame, text="Aktuell fil:").pack(anchor=tk.W, padx=4)
-        self._file_progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode="indeterminate")
-        self._file_progress.pack(fill=tk.X, padx=4, pady=(2, 0))
-        self._file_label = ttk.Label(prog_frame, text="", foreground="gray")
-        self._file_label.pack(anchor=tk.W, padx=4, pady=(0, 4))
+        ttk.Label(self, text="Textavsnitt:", padding=(8, 4)).pack(anchor="w")
 
-        # ── Logg ──────────────────────────────────────────────────────
-        log_frame = ttk.LabelFrame(self, text="Logg")
-        log_frame.pack(fill=tk.BOTH, expand=True, **pad)
-        self._log = scrolledtext.ScrolledText(
-            log_frame, height=8, state=tk.DISABLED, wrap=tk.WORD
+        # ── Scrollable card area ───────────────────────────────────────
+        scroll_container = ttk.Frame(self)
+        scroll_container.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+
+        self._canvas = tk.Canvas(scroll_container, highlightthickness=0)
+        vscroll = ttk.Scrollbar(
+            scroll_container, orient="vertical", command=self._canvas.yview
         )
-        self._log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._canvas.configure(yscrollcommand=vscroll.set)
 
-        # ── Knappar ───────────────────────────────────────────────────
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self._cancel_btn = ttk.Button(
-            btn_frame, text="Avbryt", command=self._cancel, state=tk.DISABLED
+        vscroll.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._cards_frame = ttk.Frame(self._canvas)
+        self._cards_frame.columnconfigure(0, weight=1)
+        self._window_id = self._canvas.create_window(
+            (0, 0), window=self._cards_frame, anchor="nw"
         )
-        self._cancel_btn.pack(side=tk.RIGHT, padx=(4, 0))
-        self._start_btn = ttk.Button(btn_frame, text="Starta", command=self._start)
-        self._start_btn.pack(side=tk.RIGHT)
 
-    # ─────────────────────────────────────────────────────────────────
-    # File / folder management
-    # ─────────────────────────────────────────────────────────────────
+        self._cards_frame.bind("<Configure>", self._on_frame_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._cards_frame.bind("<<Resized>>", self._on_frame_configure)
 
-    def _add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Välj PDF-filer",
-            filetypes=[("PDF-filer", "*.pdf"), ("Alla filer", "*.*")],
+        # ── Bottom buttons ─────────────────────────────────────────────
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+        btn_row = ttk.Frame(self, padding=(8, 6))
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Kopiera alla", command=self._copy_all).pack(
+            side="left", padx=(0, 6)
         )
-        self._add_paths([Path(p) for p in paths])
-
-    def _add_folder(self):
-        folder = filedialog.askdirectory(title="Välj mapp med PDF-filer")
-        if not folder:
-            return
-        pdfs = sorted(Path(folder).glob("*.pdf"))
-        if not pdfs:
-            messagebox.showinfo(
-                "Inga PDF-filer", f"Mappen innehåller inga PDF-filer:\n{folder}"
-            )
-        else:
-            self._add_paths(pdfs)
-
-    def _add_paths(self, paths: list):
-        existing = set(self._pdf_paths)
-        for p in paths:
-            if p not in existing:
-                self._pdf_paths.append(p)
-                self._listbox.insert(tk.END, str(p))
-                existing.add(p)
-
-    def _remove_selected(self):
-        for idx in reversed(self._listbox.curselection()):
-            self._listbox.delete(idx)
-            del self._pdf_paths[idx]
-
-    def _clear_list(self):
-        self._listbox.delete(0, tk.END)
-        self._pdf_paths.clear()
-
-    def _browse_output(self):
-        folder = filedialog.askdirectory(title="Välj utdatamapp")
-        if folder:
-            self._output_dir.set(folder)
-
-    # ─────────────────────────────────────────────────────────────────
-    # Start / cancel
-    # ─────────────────────────────────────────────────────────────────
-
-    def _start(self):
-        if not self._pdf_paths:
-            messagebox.showwarning("Inga filer", "Lägg till minst en PDF-fil.")
-            return
-        if not self._output_dir.get():
-            messagebox.showwarning("Ingen utdatamapp", "Välj en utdatamapp.")
-            return
-
-        self._running = True
-        self._cancel_event.clear()
-        self._conflict_event.clear()
-        self._start_btn.configure(state=tk.DISABLED)
-        self._cancel_btn.configure(state=tk.NORMAL)
-        self._progress.configure(maximum=len(self._pdf_paths), value=0)
-        self._progress_label.configure(text=f"0 av {len(self._pdf_paths)} filer")
-        self._file_progress.stop()
-        self._file_progress["value"] = 0
-        self._file_label.configure(text="")
-        self._log_clear()
-
-        self._worker = WorkerThread(
-            pdf_paths=list(self._pdf_paths),
-            output_dir=Path(self._output_dir.get()),
-            w2g=self._w2g,
-            g2w=self._g2w,
-            cancel_event=self._cancel_event,
-            conflict_event=self._conflict_event,
+        ttk.Button(btn_row, text="Kopiera markerade", command=self._copy_selected).pack(
+            side="left"
         )
-        self._worker.start()
-        self.after(100, self._poll_queue)
-
-    def _cancel(self):
-        self._cancel_event.set()
-        # Unblock worker if it is waiting on a conflict decision
-        self._g2w.put(("decision", "cancel"))
-        self._conflict_event.set()
-        self._cancel_btn.configure(state=tk.DISABLED)
-        self._log_append("Avbryter…")
 
     # ─────────────────────────────────────────────────────────────────
-    # Queue polling
+    # Canvas / scroll helpers
     # ─────────────────────────────────────────────────────────────────
 
-    def _poll_queue(self):
+    def _on_frame_configure(self, _event=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event) -> None:
+        self._canvas.itemconfig(self._window_id, width=event.width)
+
+    def _on_mousewheel(self, event) -> None:
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Thread management
+    # ─────────────────────────────────────────────────────────────────
+
+    def _start_threads(self) -> None:
+        ClipboardMonitor(self._ocr_queue, self._stop_event).start()
+        OcrWorker(
+            self._ocr_queue,
+            self._result_queue,
+            self._stop_event,
+            self._get_lang_code,
+        ).start()
+        self._poll_results()
+
+    def _get_lang_code(self) -> str:
+        return LANGUAGES.get(self._lang_var.get(), "sv-SE")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Result polling
+    # ─────────────────────────────────────────────────────────────────
+
+    def _poll_results(self) -> None:
         try:
             while True:
-                msg = self._w2g.get_nowait()
+                msg = self._result_queue.get_nowait()
                 kind = msg[0]
-
-                if kind == "progress":
-                    _, idx, total, filename = msg
-                    self._progress.configure(value=idx - 1)
-                    self._progress_label.configure(text=f"{idx - 1} av {total} filer klara")
-                    self._file_label.configure(text=f"Bearbetar: {filename}")
-                    self._file_progress.stop()
-                    self._file_progress["value"] = 0
-                    self._file_progress.start(12)
-
-                elif kind == "conflict":
-                    # Hand off to _handle_conflict; stop polling until resolved
-                    self.after_idle(lambda p=msg[1]: self._handle_conflict(p))
-                    return
-
-                elif kind == "log":
-                    self._log_append(msg[1])
-
-                elif kind == "error":
-                    self._log_append(f"✗ {msg[1]}: {msg[2]}")
-
-                elif kind == "done":
-                    self._on_done(msg[1], msg[2], msg[3])
-                    return
-
+                if kind == "pending":
+                    _, snippet_id, timestamp = msg
+                    card = SnippetCard(
+                        self._cards_frame, snippet_id, timestamp, self._copy_to_clipboard
+                    )
+                    row = len(self._cards)
+                    card.grid(row=row, column=0, sticky="ew", padx=2, pady=2)
+                    self._cards.append(card)
+                    self._pending[snippet_id] = card
+                    # Scroll to new card
+                    self.after(80, lambda: self._canvas.yview_moveto(1.0))
+                elif kind == "result":
+                    _, snippet_id, text = msg
+                    if snippet_id in self._pending:
+                        self._pending.pop(snippet_id).set_text(text)
         except queue.Empty:
             pass
-
-        if self._running:
-            self.after(100, self._poll_queue)
-
-    def _handle_conflict(self, output_path_str: str):
-        action = self._show_conflict_dialog(Path(output_path_str))
-        self._g2w.put(("decision", action))
-        if action == "cancel":
-            self._cancel_event.set()
-        self._conflict_event.set()
-        if self._running and not self._cancel_event.is_set():
-            self.after(100, self._poll_queue)
-        elif self._running:
-            # cancelled — keep polling to catch the "done" message
-            self.after(100, self._poll_queue)
+        self.after(100, self._poll_results)
 
     # ─────────────────────────────────────────────────────────────────
-    # Done
+    # Actions
     # ─────────────────────────────────────────────────────────────────
 
-    def _on_done(self, ok: int, skip: int, err: int):
-        self._running = False
-        self._start_btn.configure(state=tk.NORMAL)
-        self._cancel_btn.configure(state=tk.DISABLED)
-        self._file_progress.stop()
-        self._file_progress["value"] = 0
-        self._file_label.configure(text="")
+    def _copy_to_clipboard(self, text: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(text)
 
-        total = int(self._progress["maximum"])
-        if self._cancel_event.is_set():
-            summary = f"Avbrutet — {ok} konverterade, {skip} hoppade över, {err} fel."
-        else:
-            self._progress.configure(value=total)
-            summary = f"Klart! {ok} konverterade, {skip} hoppade över, {err} fel."
+    def _copy_all(self) -> None:
+        texts = [c.get_text() for c in self._cards if c.get_text()]
+        if not texts:
+            messagebox.showinfo("Info", "Inga textavsnitt att kopiera.", parent=self)
+            return
+        self._copy_to_clipboard(SEPARATOR.join(texts))
 
-        self._progress_label.configure(text=summary)
-        self._log_append(f"\n{summary}")
+    def _copy_selected(self) -> None:
+        texts = [c.get_text() for c in self._cards if c.is_selected() and c.get_text()]
+        if not texts:
+            messagebox.showinfo("Info", "Inga avsnitt markerade.", parent=self)
+            return
+        self._copy_to_clipboard(SEPARATOR.join(texts))
+
+    def _clear_all(self) -> None:
+        for card in self._cards:
+            card.destroy()
+        self._cards.clear()
+        self._pending.clear()
 
     # ─────────────────────────────────────────────────────────────────
-    # Conflict dialog
+    # Startup checks
     # ─────────────────────────────────────────────────────────────────
 
-    def _show_conflict_dialog(self, output_path: Path) -> str:
-        result = tk.StringVar(value="cancel")
-        dlg = tk.Toplevel(self)
-        dlg.title("Filen finns redan")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-        dlg.focus_set()
-
-        ttk.Label(
-            dlg,
-            text=f"Filen finns redan:\n{output_path.name}\n\nVad vill du göra?",
-            justify=tk.LEFT,
-            wraplength=320,
-        ).pack(padx=20, pady=(16, 10))
-
-        def choose(value):
-            result.set(value)
-            dlg.destroy()
-
-        for text, value in [
-            ("Hoppa över",      "skip"),
-            ("Hoppa över alla", "skip_all"),
-            ("Skriv över",      "overwrite"),
-            ("Skriv över alla", "overwrite_all"),
-            ("Avbryt allt",     "cancel"),
-        ]:
-            ttk.Button(dlg, text=text, width=18, command=lambda v=value: choose(v)).pack(
-                pady=2
+    def _check_deps(self) -> None:
+        if ImageGrab is None or Image is None:
+            messagebox.showerror(
+                "Pillow saknas",
+                "Pillow är inte installerat.\n\nKör: pip install pillow",
+                parent=self,
             )
-
-        ttk.Frame(dlg).pack(pady=6)
-
-        self.update_idletasks()
-        w, h = 300, 280
-        x = self.winfo_x() + (self.winfo_width() - w) // 2
-        y = self.winfo_y() + (self.winfo_height() - h) // 2
-        dlg.geometry(f"{w}x{h}+{x}+{y}")
-
-        self.wait_window(dlg)
-        return result.get()
-
-    # ─────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────
-
-    def _log_append(self, text: str):
-        self._log.configure(state=tk.NORMAL)
-        self._log.insert(tk.END, text + "\n")
-        self._log.see(tk.END)
-        self._log.configure(state=tk.DISABLED)
-
-    def _log_clear(self):
-        self._log.configure(state=tk.NORMAL)
-        self._log.delete("1.0", tk.END)
-        self._log.configure(state=tk.DISABLED)
-
-    def _check_tesseract(self):
-        if not shutil.which("tesseract"):
-            messagebox.showwarning(
-                "Tesseract saknas",
-                "Tesseract hittades inte i PATH.\n\n"
-                "Installera med:\n"
-                "  brew install tesseract tesseract-lang\n\n"
-                "Appen kan inte utföra OCR utan Tesseract.",
+            sys.exit(1)
+        if MacOCR is None:
+            messagebox.showerror(
+                "ocrmac saknas",
+                "ocrmac är inte installerat.\n\nKör: pip install ocrmac",
+                parent=self,
             )
+            sys.exit(1)
+        self._start_threads()
+
+    def _on_close(self) -> None:
+        self._stop_event.set()
+        self.destroy()
 
 
 if __name__ == "__main__":
