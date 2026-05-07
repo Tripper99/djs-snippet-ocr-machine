@@ -106,13 +106,58 @@ class OcrWorker(threading.Thread):
 
 
 def _annotations_to_text(annotations: list) -> str:
-    """Convert Vision OCR annotations to plain text, preserving line order."""
+    """Convert Vision OCR annotations to plain text with correct reading order.
+
+    Vision returns individual word tokens for complex/degraded images. We must
+    group tokens whose vertical centers are close together (same physical line),
+    then sort each group left-to-right by x before joining.
+    """
     if not annotations:
         return "(ingen text hittad)"
-    # Vision coordinates: y increases upward, so high y = near top of image.
-    # Sort descending by bbox y to get top-to-bottom reading order.
-    sorted_ann = sorted(annotations, key=lambda a: -a[2][1])
-    return "\n".join(a[0] for a in sorted_ann)
+
+    # Extract (text, center_x, center_y, height) for each token.
+    # bbox = [x, y, width, height]; (x,y) is bottom-left in Vision coords
+    # where y=0 is the bottom of the image and y increases upward.
+    items: list[tuple[str, float, float, float]] = []
+    for ann in annotations:
+        text, _conf, bbox = ann[0], ann[1], ann[2]
+        bx, by, bw, bh = bbox[0], bbox[1], bbox[2], bbox[3]
+        items.append((text, bx + bw / 2, by + bh / 2, bh))
+
+    # Estimate typical line height from median token height.
+    median_h = sorted(i[3] for i in items)[len(items) // 2]
+    # Tokens whose vertical centers are within 60% of a line height apart
+    # are considered to be on the same physical line.
+    threshold = median_h * 0.6
+
+    # Sort top-to-bottom (high cy = near top of image in Vision coords).
+    items.sort(key=lambda t: -t[2])
+
+    # Greedy line clustering: assign each token to the existing line whose
+    # mean center_y is closest, or start a new line if none is close enough.
+    lines: list[list[tuple[str, float, float, float]]] = []
+    for item in items:
+        best_idx: int | None = None
+        best_dist = float("inf")
+        for i, line in enumerate(lines):
+            line_cy = sum(t[2] for t in line) / len(line)
+            dist = abs(item[2] - line_cy)
+            if dist <= threshold and dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        if best_idx is not None:
+            lines[best_idx].append(item)
+        else:
+            lines.append([item])
+
+    # Sort lines top-to-bottom, then tokens within each line left-to-right.
+    lines.sort(key=lambda ln: -sum(t[2] for t in ln) / len(ln))
+    result = []
+    for line in lines:
+        line.sort(key=lambda t: t[1])
+        result.append(" ".join(t[0] for t in line))
+
+    return "\n".join(result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
